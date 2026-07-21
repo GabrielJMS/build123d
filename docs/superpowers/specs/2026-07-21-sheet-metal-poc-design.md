@@ -69,7 +69,10 @@ dimension).
 rectangular slab (offset `-(thickness+radius)` / `-radius` respectively) so the fold
 consumes existing material.
 
-### `hem(edges, hem_type=HemType.FLAT, width=None, opening=0, radius=None, roll_angle=270, clean=False, mode=Mode.ADD, thickness=None)`
+### `hem(edges, hem_type=HemType.FLAT, width=None, opening=0, radius=None, roll_angle=None, clean=False, mode=Mode.ADD, thickness=None)`
+
+(`roll_angle=None` → the physical maximum `270° + asin(r/(r+t))`, matching
+FreeCAD, rather than a fixed 270° — decided during implementation.)
 
 `width` (total hem width, including the bend) is required for FLAT/OPEN/TEARDROP and
 ignored for ROLLED; `radius` is used by TEARDROP/ROLLED and defaults to the context's
