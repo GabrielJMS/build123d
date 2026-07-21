@@ -15,8 +15,17 @@ and `AddHem` — into build123d idioms shaped like gumyr's `BuildSheet` ideation
 
 **Explicitly out of scope** (listed in the PR as a contribution roadmap): `unfold`,
 `Bend` between two sketch regions, `BendLine`, `Tab`, bend reliefs, auto/manual miters,
-perforation, open-profile bases (users have `make_brake_formed`), `smCreateBaseShape`
-parametric starters (flat/L/U/tub/hat/box), and `Material` integration.
+perforation, open-profile bases, `smCreateBaseShape` parametric starters
+(flat/L/U/tub/hat/box), and `Material` integration.
+
+Open-profile bases (FreeCAD `smBase`'s wire branch) have a sketched follow-up design:
+a `base_sheet(width, side)` operation consuming a `BuildLine` profile from the pending
+edges (mirroring `BuildSketch` → `extrude` in `BuildPart`), auto-filleting sharp
+corners at the bend radius (FreeCAD pre-rounds the mid-surface wire at
+`radius + thickness/2`), thickening the wire into a cross-section face and extruding
+once — which naturally keeps bend cylinders as distinct faces. Until then,
+`make_brake_formed` is the open-profile answer — and the POC enables it inside
+`BuildSheet` (see below).
 
 ## User-facing API
 
@@ -74,6 +83,27 @@ Covers `AddHem`, all four types. Each type is a pure parameter generator returni
 - `TEARDROP`: bisection solve of FreeCAD's residual
   `L − Lp + Lbend + t·sin(2·atan(R/L)) = 0` → angle `180° + 2·atan(R/L)`
 
+### `make_brake_formed` enabled inside `BuildSheet`
+
+The existing operation is registered for `BuildSheet`
+(`"make_brake_formed": ["BuildPart", "BuildSheet"]` in `operations_apply_to`) and
+`BuildSheet._add_to_pending` stores edges, so a `BuildLine` profile exiting into
+`BuildSheet` feeds it via `context.pending_edges` — an interim open-profile base:
+
+```python
+with BuildSheet(thickness=1) as bracket:
+    with BuildLine() as profile:
+        FilletPolyline((0, 0), (20, 0), (20, 15), radius=2)  # arcs pre-drawn
+    make_brake_formed(thickness=1, station_widths=30)
+```
+
+Because in-context it delegates `clean` to `_add_to_context`
+(`operations_part.py:450`) and `BuildSheet` forces `clean=False`, bend faces survive
+automatically. Documented caveats: `thickness` is passed explicitly (signature change
+to default from the context is deferred — touches an existing public API, open
+question for gumyr), and sharp corners must be pre-drawn as arcs (no auto-fillet,
+unlike FreeCAD's `smBase`).
+
 ### Conventions honored
 
 - Operations are lowercase module-level **functions** (not classes), per build123d's
@@ -91,7 +121,7 @@ Covers `AddHem`, all four types. Each type is a pure parameter generator returni
 | `src/build123d/build_sheet.py` | `class BuildSheet(Builder[Part])`: `_tag="BuildSheet"`, `_obj_name="sheet"`, `_shape=Solid`, `_sub_class=Part`; stores `thickness`, `bend_radius`, `k_factor`; `_add_to_context` override auto-pads incoming `Face`s and forces `clean=False` |
 | `src/build123d/operations_sheet.py` | `flange()`, `hem()`, private `_make_bend()` engine, `_hem_parameters()` generators |
 | `src/build123d/build_enums.py` | `HemType`, `BendPosition` |
-| `src/build123d/build_common.py` | register `"flange"`, `"hem"` in `operations_apply_to` |
+| `src/build123d/build_common.py` | register `"flange"`, `"hem"` in `operations_apply_to`; add `"BuildSheet"` to `"make_brake_formed"` |
 | `src/build123d/__init__.py` | module import + `__all__` entries |
 | `tests/test_build_sheet.py` | full test suite (below) |
 | `docs/build_sheet.rst` | sheet metal section page mirroring `build_part.rst`: concepts (thickness, bend radius, k-factor, fan-face/no-clean warning), API usage, autodoc references |
@@ -151,6 +181,8 @@ FreeCAD); non-converging teardrop bisection. Wrong-builder usage is caught by th
   `gap1`/`gap2`; each `BendPosition`; multi-edge selection.
 - **hem**: all four types produce valid solids; parameter generators unit-tested
   numerically (teardrop residual < tol; open-hem radius = opening/2).
+- **make_brake_formed in BuildSheet**: BuildLine profile → valid solid; face count
+  preserved vs. a `.clean()`ed copy (fan faces survive via forced `clean=False`).
 - **algebra mode**: flange/hem without context, explicit `thickness` (mirrors
   `test_algebra.py`).
 - **errors**: every `ValueError` path above.
