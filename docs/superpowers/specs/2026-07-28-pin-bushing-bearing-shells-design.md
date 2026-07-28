@@ -83,7 +83,7 @@ them with the existing `rod_loc` transform.
 - One ø3.2 radial hole at +Z, coaxial with the rod's existing small-end oil
   hole — without it the drilled path from the boss top dead-ends on the bush
   OD and the pin is never fed.
-- Phosphor bronze, 8.8 g/cm³ → ~52 g.
+- Phosphor bronze, 8.8 g/cm³ → **measured 5.824 cm³ / 51.3 g**.
 
 ### `bearing_shell.py` — one half-shell, used twice
 
@@ -94,7 +94,7 @@ them with the existing `rod_loc` transform.
   the same solid rotated 180° about X, which maps (x,y,z) → (x,−y,−z): the
   tang stays at +X and the body drops below the split plane. With an
   off-centre tang the pair would have to be mirror images.
-- Steel-backed trimetal, 8.0 g/cm³ → ~56 g each.
+- Steel-backed trimetal, 8.0 g/cm³ → **measured 7.021 cm³ / 56.2 g each**.
 
 ## Modified parts
 
@@ -108,6 +108,30 @@ them with the existing `rod_loc` transform.
   filter keys off `small_od / 2`; the oil hole already starts at
   `small_od / 2 + 1` above the centre and runs `small_od / 2 + 3`, so it
   follows the boss out and still breaks into the bore.
+- **`pocket_z1` becomes derived — found during implementation, not designed
+  up front.** With `small_od` at 38 the boss/shank blend arc bottoms out at
+  Z=141, which put it exactly 3.0 above the I-beam pocket top at Z=138 —
+  exactly `2 × shank_fillet`. The two R1.5 fillets then meet tangentially
+  with no face between them and OCC refuses the *entire* blanket fillet.
+  The failure is razor-thin and so reads as a mystery: R=1.5 fails where
+  R=1.497 succeeds, every edge subgroup passes alone, and no single edge
+  removal fixes it (`boss+pocket` and `boss+arch` fail, `pocket+arch`
+  passes). Fixed dimensionally rather than by weakening the radius or
+  hacking the edge filter:
+
+  ```python
+  pocket_z1 = rod_len - small_od / 2 - 3 * shank_fillet    # 136.5
+  ```
+
+  3 × the radius leaves a real face between the two blends, and deriving it
+  means the next change to `small_od` cannot silently recreate the
+  collision. Cost: the pocket is 1.5 shorter, so the rod carries a little
+  more metal near the boss. `shank_fillet` moved up the constant block to
+  be defined before this line.
+
+  The general rule worth remembering: **two edges that will both be
+  filleted must stay more than 2 × the radius apart.** At exactly 2 × R the
+  fillets are tangent and the operation fails.
 - Tang notch, **cut last, after every fillet** — the project's established
   late-cut rule (the oil groove and pin lube bores in `piston.py` broke
   fillets when cut early). 4.4 wide along Y (0.2 clearance per side), 1.9
@@ -143,15 +167,35 @@ them with the existing `rod_loc` transform.
 
 ## Verification
 
+All of it is automated in `piston/check_bearings.py` — five checks, run with
+`cd piston && uv run python check_bearings.py`. It builds the solids and
+asserts on measured geometry, because this project has no pytest suite for
+the CAD parts. Result: **OK 5/5**.
+
 1. Each new part: render, `is_valid`, exactly one solid, volume and mass
-   printed and matched against the hand figures above (~52 g bush, ~56 g
-   shell).
-2. `rod.py` and `rod_cap.py`: still one solid each, all existing fillet
-   sections still pass, new mass reported (rod gains ~18 g net — the ø38 boss
-   adds more than the ø28 bore removes).
-3. Assembly: 15 children, render from four views.
+   matched against the hand figures — bush 51.3 g vs ~52 estimated, shell
+   56.2 g vs ~56. Both inside the 5% band.
+2. `rod.py` and `rod_cap.py`: one valid solid each, all existing fillet
+   sections still pass. Measured masses (steel 7.85):
+
+   | part | before | after | delta |
+   |---|---|---|---|
+   | rod | 84.39 cm³ / 662.4 g | 85.77 cm³ / 673.3 g | **+10.9 g** |
+   | cap | 26.86 cm³ / 210.9 g | 26.85 cm³ / 210.8 g | −0.1 g (the notch) |
+
+   The rod's +10.9 g replaces the spec's original ~18 g estimate, which
+   ignored both the shank's overlap into the new boss annulus and the R2 rim
+   fillets. It also now includes the metal the shortened pocket leaves
+   behind.
+
+   Bearing metal added to the group: 51.3 + 2 × 56.2 = **163.7 g**.
+3. Assembly: 15 children, rendered from four views; the bush reads as a ring
+   inside the small-end boss and the ø60 shell bore inside the big end.
 4. Boolean interference sweep, reported as volumes: bush∩pin, bush∩rod,
-   shell∩rod, shell∩cap, shell∩shell, tang∩notch. All expected 0 mm³.
+   bush∩piston, shell∩rod, shell∩cap, shell∩shell, pin∩rod, and a positive
+   tang-pocket probe on each half. **All 0.000 mm³.** The tang check is a
+   genuine red/green: before the notches were cut it reported 9.070 mm³ of
+   tang-into-rod interference.
 
 ### Known modelling caveat to record
 
