@@ -7,6 +7,7 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).with_name("sync_upstream.py")
@@ -101,6 +102,90 @@ class ParsingTests(unittest.TestCase):
             ),
             "Normal-Company/build123d",
         )
+
+
+class PullRequestUpdateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.config = sync_upstream.Config(
+            repository="Normal-Company/build123d",
+            base_branch="dev",
+            upstream_repository="gumyr/build123d",
+            upstream_branch="dev",
+            sync_branch="automation/sync-upstream-dev",
+            target_remote="origin",
+            upstream_remote="upstream",
+            reconcile_pull_requests=True,
+            dry_run=False,
+        )
+        self.pull = {
+            "number": 1,
+            "maintainer_can_modify": True,
+            "head": {
+                "ref": "contributor/change",
+                "repo": {"full_name": "contributor/build123d"},
+            },
+        }
+
+    def test_editable_fork_uses_direct_merge_without_api(self) -> None:
+        with (
+            patch.object(sync_upstream, "api") as api,
+            patch.object(
+                sync_upstream,
+                "merge_base_into_pull_head",
+                return_value="c" * 40,
+            ) as merge,
+        ):
+            method = sync_upstream.update_pull_request_branch(
+                self.config,
+                pull=self.pull,
+                actual_head_sha="a" * 40,
+                base_sha="b" * 40,
+            )
+
+        self.assertEqual(method, "direct Git merge for editable fork")
+        api.assert_not_called()
+        merge.assert_called_once()
+
+    def test_locked_fork_uses_neither_api_nor_direct_push(self) -> None:
+        self.pull["maintainer_can_modify"] = False
+        with (
+            patch.object(sync_upstream, "api") as api,
+            patch.object(sync_upstream, "merge_base_into_pull_head") as merge,
+        ):
+            with self.assertRaises(sync_upstream.AutomationError):
+                sync_upstream.update_pull_request_branch(
+                    self.config,
+                    pull=self.pull,
+                    actual_head_sha="a" * 40,
+                    base_sha="b" * 40,
+                )
+
+        api.assert_not_called()
+        merge.assert_not_called()
+
+    def test_same_repository_api_failure_uses_direct_merge_fallback(self) -> None:
+        self.pull["head"]["repo"]["full_name"] = self.config.repository
+        with (
+            patch.object(
+                sync_upstream,
+                "api",
+                side_effect=sync_upstream.ApiError("API unavailable"),
+            ),
+            patch.object(
+                sync_upstream,
+                "merge_base_into_pull_head",
+                return_value="c" * 40,
+            ) as merge,
+        ):
+            method = sync_upstream.update_pull_request_branch(
+                self.config,
+                pull=self.pull,
+                actual_head_sha="a" * 40,
+                base_sha="b" * 40,
+            )
+
+        self.assertEqual(method, "direct Git merge fallback")
+        merge.assert_called_once()
 
 
 if __name__ == "__main__":

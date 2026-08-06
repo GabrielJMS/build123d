@@ -15,9 +15,12 @@ The workflow synchronizes `gumyr/build123d:dev` into
    polluted `dev`.
 3. Once the upstream head is in downstream `dev`, the workflow asks GitHub to
    merge the refreshed base into each stale open PR branch. GitHub performs
-   only clean branch updates. True content conflicts and inaccessible fork
-   branches are reported in the workflow summary and fail the job so a person
-   can resolve them without the automation discarding either side.
+   only clean branch updates. Maintainer-editable fork PRs bypass that API and
+   use an ordinary Git merge plus non-force push directly; same-repository PRs
+   use the same fallback if the API fails. True content conflicts and
+   inaccessible fork branches are reported in the workflow summary and fail
+   the job so a person can resolve them without the automation discarding
+   either side.
 
 The stable automation branch is force-updated only with an exact
 `--force-with-lease`. An existing branch that is not recognizable as belonging

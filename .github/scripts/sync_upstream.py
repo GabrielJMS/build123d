@@ -16,6 +16,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -488,6 +489,141 @@ def is_ancestor(ancestor: str, descendant: str) -> bool:
     return result.returncode == 0
 
 
+def merge_base_into_pull_head(
+    config: Config,
+    *,
+    pull_number: int,
+    head_repository: str,
+    head_branch: str,
+    head_sha: str,
+    base_sha: str,
+) -> str:
+    """Create and push a normal merge when GitHub cannot update the branch."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", head_repository):
+        raise AutomationError(
+            f"PR #{pull_number} returned an invalid head repository: "
+            f"{head_repository!r}"
+        )
+    validate_branch(head_branch)
+
+    with tempfile.TemporaryDirectory(
+        prefix=f"upstream-sync-pr-{pull_number}-"
+    ) as temporary_directory:
+        worktree = Path(temporary_directory) / "worktree"
+        worktree_added = False
+        try:
+            run(
+                [
+                    "git",
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(worktree),
+                    head_sha,
+                ]
+            )
+            worktree_added = True
+            merge = run(
+                [
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "merge",
+                    "--no-edit",
+                    base_sha,
+                ],
+                check=False,
+            )
+            if merge.returncode:
+                detail = (merge.stderr or merge.stdout).strip()
+                raise AutomationError(
+                    f"PR #{pull_number} has a true content conflict"
+                    + (f": {detail}" if detail else "")
+                )
+
+            merged_sha = run(
+                ["git", "-C", str(worktree), "rev-parse", "HEAD"]
+            ).stdout.strip()
+            push_destination = (
+                config.target_remote
+                if head_repository.lower() == config.repository.lower()
+                else f"https://github.com/{head_repository}.git"
+            )
+            # A normal push makes a concurrent head change fail safely. Never
+            # force-update contributor branches.
+            run(
+                [
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "push",
+                    push_destination,
+                    f"HEAD:refs/heads/{head_branch}",
+                ]
+            )
+            return merged_sha
+        finally:
+            if worktree_added:
+                run(
+                    ["git", "worktree", "remove", "--force", str(worktree)],
+                    check=False,
+                )
+
+
+def update_pull_request_branch(
+    config: Config,
+    *,
+    pull: dict[str, Any],
+    actual_head_sha: str,
+    base_sha: str,
+) -> str:
+    """Update a PR head through GitHub, with a safe Git merge fallback."""
+    number = int(pull["number"])
+    head = pull.get("head") or {}
+    head_branch = str(head.get("ref", ""))
+    head_repository = str((head.get("repo") or {}).get("full_name", ""))
+    same_repository = head_repository.lower() == config.repository.lower()
+
+    # GitHub's update-branch endpoint can have surprising lifecycle side
+    # effects on cross-repository PRs. Use the explicit, non-force Git path for
+    # editable fork heads and never call the endpoint for them.
+    if not same_repository:
+        if not pull.get("maintainer_can_modify", False):
+            raise AutomationError("the fork branch does not allow maintainer updates")
+        merge_base_into_pull_head(
+            config,
+            pull_number=number,
+            head_repository=head_repository,
+            head_branch=head_branch,
+            head_sha=actual_head_sha,
+            base_sha=base_sha,
+        )
+        return "direct Git merge for editable fork"
+
+    try:
+        api(
+            "PUT",
+            f"repos/{config.repository}/pulls/{number}/update-branch",
+            {"expected_head_sha": actual_head_sha},
+        )
+        return "GitHub update-branch API"
+    except ApiError as api_error:
+        try:
+            merge_base_into_pull_head(
+                config,
+                pull_number=number,
+                head_repository=head_repository,
+                head_branch=head_branch,
+                head_sha=actual_head_sha,
+                base_sha=base_sha,
+            )
+        except AutomationError as merge_error:
+            raise AutomationError(
+                f"{api_error}; direct merge fallback also failed: {merge_error}"
+            ) from merge_error
+        return "direct Git merge fallback"
+
+
 def reconcile_open_pull_requests(
     config: Config, *, base_sha: str
 ) -> tuple[list[str], list[str], list[str]]:
@@ -519,13 +655,14 @@ def reconcile_open_pull_requests(
             continue
 
         try:
-            api(
-                "PUT",
-                f"repos/{config.repository}/pulls/{number}/update-branch",
-                {"expected_head_sha": actual_head_sha},
+            update_method = update_pull_request_branch(
+                config,
+                pull=pull,
+                actual_head_sha=actual_head_sha,
+                base_sha=base_sha,
             )
-            updated.append(f"PR #{number} ({head_ref})")
-        except ApiError as exc:
+            updated.append(f"PR #{number} ({head_ref}) via {update_method}")
+        except AutomationError as exc:
             failures.append(
                 f"PR #{number} ({head_ref}): GitHub could not merge "
                 f"{config.base_branch} into the branch ({exc})"
