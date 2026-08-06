@@ -1,0 +1,51 @@
+name: Daily upstream sync
+
+on:
+  schedule:
+    # 09:17 UTC avoids the high-load start of the hour.
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: daily-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'Normal-Company/build123d'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # A PAT or GitHub App token is optional. The repository token is enough
+      # for direct pushes and same-repository PR updates when Actions is allowed
+      # to create PRs. A configured token can also update permitted fork heads.
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+      BASE_BRANCH: dev
+      UPSTREAM_REPOSITORY: gumyr/build123d
+      UPSTREAM_BRANCH: dev
+      SYNC_BRANCH: automation/sync-upstream-dev
+      RECONCILE_PULL_REQUESTS: "true"
+
+    steps:
+      - name: Check out downstream dev
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: dev
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Test synchronization policy
+        run: python .github/scripts/test_sync_upstream.py
+
+      - name: Configure authenticated Git access
+        run: |
+          gh auth setup-git
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Synchronize upstream and reconcile PR branches
+        run: python .github/scripts/sync_upstream.py
