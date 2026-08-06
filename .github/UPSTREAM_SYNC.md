@@ -16,9 +16,13 @@ The workflow synchronizes `gumyr/build123d:dev` into
 3. Once the upstream head is in downstream `dev`, the workflow processes every
    open PR in base-to-head dependency order. It updates stale heads with an
    ordinary Git merge and non-force push, so stacked PRs are refreshed from
-   parent to child in the same run. True content conflicts and inaccessible
-   fork branches are reported in the workflow summary and fail the job so a
-   person can resolve them without the automation discarding either side.
+   parent to child in the same run. True content conflicts are reported in the
+   workflow summary and fail the job so a person can resolve them without the
+   automation discarding either side. Cross-repository heads are skipped unless
+   their repository is explicitly trusted as described below.
+4. After reconciliation, the workflow builds on the existing `nightly` tip,
+   merges current `dev` and every exact open PR head in dependency order, and
+   pushes only when `nightly` can be advanced with a normal fast-forward.
 
 The stable automation branch is force-updated only with an exact
 `--force-with-lease`. An existing branch that is not recognizable as belonging
@@ -31,13 +35,15 @@ uses the repository `GITHUB_TOKEN` by default. For that token to create the
 upstream-sync PR, enable **Settings → Actions → General → Allow GitHub Actions
 to create and approve pull requests**.
 
-For fully unattended CI on automation-created/updated PRs, or to update an
-allowed PR head in another repository, configure an `UPSTREAM_SYNC_TOKEN`
+For fully unattended CI on automation-created/updated PRs, configure an
+`UPSTREAM_SYNC_TOKEN`
 repository secret backed by a narrowly scoped GitHub App token or fine-grained
 PAT. It needs Contents and Pull requests write access to
-`Normal-Company/build123d`; cross-repository head updates additionally require
-write access to that head repository. The workflow falls back to
-`github.token` when the secret is absent.
+`Normal-Company/build123d`. Cross-repository PR heads are skipped by default.
+To update one, put its exact lowercase `owner/repository` value in the
+comma-separated `TRUSTED_FORK_REPOSITORIES` allowlist and give the token write
+access to that repository. The workflow falls back to `github.token` when the
+secret is absent.
 
 ## Local dry run
 

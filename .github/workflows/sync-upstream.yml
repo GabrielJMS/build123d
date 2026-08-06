@@ -29,6 +29,9 @@ jobs:
       UPSTREAM_BRANCH: dev
       SYNC_BRANCH: automation/sync-upstream-dev
       RECONCILE_PULL_REQUESTS: "true"
+      INTEGRATION_BRANCH: nightly
+      # Cross-repository writes are denied unless an exact repository is listed.
+      TRUSTED_FORK_REPOSITORIES: ""
 
     steps:
       - name: Check out downstream dev
@@ -47,5 +50,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Synchronize upstream and reconcile PR branches
+      - name: Synchronize upstream, PR branches, and nightly
         run: python .github/scripts/sync_upstream.py

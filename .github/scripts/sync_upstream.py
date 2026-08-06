@@ -4,7 +4,8 @@
 The script fast-forwards an unmodified downstream branch, or maintains a
 stable pull request when downstream-only commits make a fast-forward
 impossible. Once upstream is present in the downstream branch, open pull
-request branches are updated with GitHub's conflict-safe merge endpoint.
+request branches and the configured integration branch are advanced with
+ordinary, non-force Git merges.
 """
 
 from __future__ import annotations
@@ -35,6 +36,10 @@ class ApiError(AutomationError):
     """A GitHub API request failure."""
 
 
+class PullRequestSkipped(AutomationError):
+    """A safe PR-head update that policy intentionally declined."""
+
+
 @dataclass(frozen=True)
 class Divergence:
     """Commit counts unique to the downstream and upstream branches."""
@@ -44,6 +49,7 @@ class Divergence:
 
     @property
     def action(self) -> str:
+        """Return the safe synchronization action for these commit counts."""
         if self.upstream_only == 0:
             return "already-current"
         if self.downstream_only == 0:
@@ -53,6 +59,8 @@ class Divergence:
 
 @dataclass(frozen=True)
 class Config:
+    """Validated runtime settings for one upstream synchronization run."""
+
     repository: str
     base_branch: str
     upstream_repository: str
@@ -61,10 +69,13 @@ class Config:
     target_remote: str
     upstream_remote: str
     reconcile_pull_requests: bool
+    integration_branch: str | None
+    trusted_fork_repositories: frozenset[str]
     dry_run: bool
 
     @classmethod
     def from_environment(cls, *, dry_run: bool) -> "Config":
+        """Build and validate configuration from workflow environment values."""
         repository = require_env("GITHUB_REPOSITORY")
         base_branch = os.environ.get("BASE_BRANCH", "dev")
         upstream_repository = os.environ.get("UPSTREAM_REPOSITORY", "gumyr/build123d")
@@ -77,11 +88,21 @@ class Config:
         reconcile_pull_requests = parse_bool(
             os.environ.get("RECONCILE_PULL_REQUESTS", "true")
         )
+        integration_branch = os.environ.get("INTEGRATION_BRANCH", "").strip() or None
+        trusted_fork_repositories = frozenset(
+            item.strip().lower()
+            for item in os.environ.get("TRUSTED_FORK_REPOSITORIES", "").split(",")
+            if item.strip()
+        )
 
-        for label, value in (
+        repository_values = [
             ("GITHUB_REPOSITORY", repository),
             ("UPSTREAM_REPOSITORY", upstream_repository),
-        ):
+        ]
+        repository_values.extend(
+            ("TRUSTED_FORK_REPOSITORIES", value) for value in trusted_fork_repositories
+        )
+        for label, value in repository_values:
             if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value):
                 raise AutomationError(
                     f"{label} is not an owner/repository value: {value}"
@@ -96,6 +117,10 @@ class Config:
 
         if sync_branch == base_branch:
             raise AutomationError("SYNC_BRANCH must differ from BASE_BRANCH")
+        if integration_branch in {base_branch, sync_branch}:
+            raise AutomationError(
+                "INTEGRATION_BRANCH must differ from BASE_BRANCH and SYNC_BRANCH"
+            )
 
         return cls(
             repository=repository,
@@ -106,11 +131,14 @@ class Config:
             target_remote=target_remote,
             upstream_remote=upstream_remote,
             reconcile_pull_requests=reconcile_pull_requests,
+            integration_branch=integration_branch,
+            trusted_fork_repositories=trusted_fork_repositories,
             dry_run=dry_run,
         )
 
 
 def require_env(name: str) -> str:
+    """Return one required environment value or raise an actionable error."""
     value = os.environ.get(name)
     if not value:
         raise AutomationError(f"Required environment variable {name} is not set")
@@ -118,6 +146,7 @@ def require_env(name: str) -> str:
 
 
 def parse_bool(value: str) -> bool:
+    """Parse a conventional environment boolean value."""
     normalized = value.strip().lower()
     if normalized in {"1", "true", "yes", "on"}:
         return True
@@ -133,6 +162,7 @@ def run(
     input_text: str | None = None,
     show_output: bool = False,
 ) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess and convert checked failures into AutomationError."""
     print(f"+ {shlex.join(args)}")
     result = subprocess.run(
         list(args),
@@ -158,6 +188,7 @@ def api(
     path: str,
     payload: dict[str, Any] | None = None,
 ) -> Any:
+    """Call the GitHub REST API through the authenticated gh CLI."""
     args = [
         "gh",
         "api",
@@ -185,6 +216,7 @@ def api(
 def list_pull_requests(
     config: Config, *, state: str, base: str | None = None
 ) -> list[dict[str, Any]]:
+    """Return every pull request matching the requested state and base."""
     pulls: list[dict[str, Any]] = []
     page = 1
     while True:
@@ -205,6 +237,7 @@ def list_pull_requests(
 
 
 def github_repository_from_url(url: str) -> str | None:
+    """Extract an owner/repository slug from a supported GitHub remote URL."""
     match = re.search(
         r"(?:github\.com[/:])(?P<repository>[^/\s]+/[^/\s]+?)(?:\.git)?$", url
     )
@@ -214,6 +247,7 @@ def github_repository_from_url(url: str) -> str | None:
 
 
 def ensure_remote(name: str, repository: str, *, allow_create: bool) -> None:
+    """Verify a Git remote's repository, creating it only when permitted."""
     result = run(["git", "remote", "get-url", name], check=False)
     if result.returncode:
         if not allow_create:
@@ -230,12 +264,14 @@ def ensure_remote(name: str, repository: str, *, allow_create: bool) -> None:
 
 
 def validate_branch(branch: str) -> None:
+    """Reject values that are not valid Git branch names."""
     result = run(["git", "check-ref-format", "--branch", branch], check=False)
     if result.returncode:
         raise AutomationError(f"Invalid branch name: {branch}")
 
 
 def fetch_branches(config: Config) -> tuple[str, str]:
+    """Fetch and return the exact downstream and upstream branch heads."""
     ensure_remote(config.target_remote, config.repository, allow_create=False)
     ensure_remote(config.upstream_remote, config.upstream_repository, allow_create=True)
     validate_branch(config.base_branch)
@@ -277,6 +313,7 @@ def fetch_branches(config: Config) -> tuple[str, str]:
 
 
 def classify_divergence(output: str) -> Divergence:
+    """Parse the two counts emitted by git rev-list --left-right --count."""
     fields = output.split()
     if len(fields) != 2:
         raise AutomationError(f"Unexpected rev-list count output: {output!r}")
@@ -288,6 +325,7 @@ def classify_divergence(output: str) -> Divergence:
 
 
 def divergence_for(base_sha: str, upstream_sha: str) -> Divergence:
+    """Measure commits unique to the downstream and upstream heads."""
     result = run(
         [
             "git",
@@ -301,6 +339,7 @@ def divergence_for(base_sha: str, upstream_sha: str) -> Divergence:
 
 
 def remote_branch_sha(config: Config, branch: str) -> str | None:
+    """Return the target remote branch SHA when the branch exists."""
     result = run(
         [
             "git",
@@ -321,6 +360,7 @@ def sync_pr_body(
     upstream_sha: str,
     divergence: Divergence,
 ) -> str:
+    """Build the stable, auditable body for the upstream synchronization PR."""
     return f"""{SYNC_MARKER}
 This pull request is maintained by the daily upstream-sync workflow.
 
@@ -341,6 +381,7 @@ PR branches wherever GitHub can do so without choosing a conflict side.
 
 
 def sync_pr_title(config: Config) -> str:
+    """Build the stable title for the upstream synchronization PR."""
     return (
         f"[automation] Sync {config.upstream_repository}/"
         f"{config.upstream_branch} into {config.base_branch}"
@@ -350,6 +391,7 @@ def sync_pr_title(config: Config) -> str:
 def matching_sync_pulls(
     config: Config, pulls: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
+    """Select PRs whose head is the configured automation branch."""
     matches = []
     for pull in pulls:
         head = pull.get("head") or {}
@@ -370,6 +412,7 @@ def publish_sync_branch_and_pr(
     upstream_sha: str,
     divergence: Divergence,
 ) -> str:
+    """Publish the exact upstream head and create or update its stable PR."""
     all_pulls = list_pull_requests(config, state="all", base=config.base_branch)
     matches = matching_sync_pulls(config, all_pulls)
     open_matches = [pull for pull in matches if pull.get("state") == "open"]
@@ -444,6 +487,7 @@ def publish_sync_branch_and_pr(
 
 
 def fast_forward_base(config: Config, *, base_sha: str, upstream_sha: str) -> str:
+    """Advance an unpolluted downstream branch to the exact upstream head."""
     if config.dry_run:
         return (
             f"Would fast-forward {config.repository}:{config.base_branch} "
@@ -464,6 +508,7 @@ def fast_forward_base(config: Config, *, base_sha: str, upstream_sha: str) -> st
 
 
 def pull_head_ref(config: Config, pull_number: int) -> str:
+    """Fetch one immutable pull-request head and return its local ref name."""
     local_ref = f"refs/remotes/{config.target_remote}/pull/{pull_number}/head"
     run(
         [
@@ -478,6 +523,7 @@ def pull_head_ref(config: Config, pull_number: int) -> str:
 
 
 def is_ancestor(ancestor: str, descendant: str) -> bool:
+    """Return whether one commit is an ancestor of another commit."""
     result = run(
         ["git", "merge-base", "--is-ancestor", ancestor, descendant],
         check=False,
@@ -603,6 +649,7 @@ def order_pull_requests(pulls: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def fetch_pull_base(config: Config, pull: dict[str, Any]) -> tuple[str, str]:
+    """Fetch a PR base branch and return its name and exact head SHA."""
     base_branch = str((pull.get("base") or {}).get("ref", ""))
     validate_branch(base_branch)
     base_ref = f"refs/remotes/{config.target_remote}/{base_branch}"
@@ -632,8 +679,28 @@ def update_pull_request_branch(
     head_repository = str((head.get("repo") or {}).get("full_name", ""))
     same_repository = head_repository.lower() == config.repository.lower()
 
-    if not same_repository and not pull.get("maintainer_can_modify", False):
-        raise AutomationError("the fork branch does not allow maintainer updates")
+    if not same_repository:
+        if head_repository.lower() not in config.trusted_fork_repositories:
+            raise PullRequestSkipped(
+                f"fork {head_repository} is not in TRUSTED_FORK_REPOSITORIES"
+            )
+        detailed_pull = api("GET", f"repos/{config.repository}/pulls/{number}")
+        detailed_head = detailed_pull.get("head") or {}
+        detailed_repository = str(
+            (detailed_head.get("repo") or {}).get("full_name", "")
+        )
+        if (
+            detailed_repository.lower() != head_repository.lower()
+            or str(detailed_head.get("ref", "")) != head_branch
+            or str(detailed_head.get("sha", "")) != actual_head_sha
+        ):
+            raise AutomationError(
+                f"PR #{number} head changed while validating fork permissions"
+            )
+        if not detailed_pull.get("maintainer_can_modify", False):
+            raise PullRequestSkipped(
+                "the allowlisted fork branch does not allow maintainer updates"
+            )
     merge_base_into_pull_head(
         config,
         pull_number=number,
@@ -649,17 +716,19 @@ def update_pull_request_branch(
 
 def reconcile_open_pull_requests(
     config: Config,
-) -> tuple[list[str], list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """Merge current bases into stale PR heads in dependency order."""
     pulls = order_pull_requests(list_pull_requests(config, state="open"))
     current: list[str] = []
     updated: list[str] = []
+    skipped: list[str] = []
     failures: list[str] = []
 
     for pull in pulls:
         number = int(pull["number"])
         head = pull.get("head") or {}
         head_ref = str(head.get("ref", ""))
-        if head_ref == config.sync_branch:
+        if head_ref == config.sync_branch or head_ref == config.integration_branch:
             continue
 
         try:
@@ -675,6 +744,16 @@ def reconcile_open_pull_requests(
             current.append(label)
             continue
 
+        head_repository = str((head.get("repo") or {}).get("full_name", ""))
+        if (
+            head_repository.lower() != config.repository.lower()
+            and head_repository.lower() not in config.trusted_fork_repositories
+        ):
+            skipped.append(
+                f"{label}: fork {head_repository} is not allowlisted for writes"
+            )
+            continue
+
         if config.dry_run:
             updated.append(f"{label} [dry run]")
             continue
@@ -687,15 +766,150 @@ def reconcile_open_pull_requests(
                 base_sha=base_sha,
             )
             updated.append(f"{label} via {update_method}")
+        except PullRequestSkipped as exc:
+            skipped.append(f"{label}: {exc}")
         except AutomationError as exc:
             failures.append(
                 f"{label}: could not merge {base_branch} into the branch ({exc})"
             )
 
-    return current, updated, failures
+    return current, updated, skipped, failures
+
+
+def refresh_integration_branch(config: Config) -> str:
+    """Fast-forward the integration branch after merging every open PR head."""
+    if not config.integration_branch:
+        return "Integration branch refresh disabled"
+    integration_branch = config.integration_branch
+    validate_branch(integration_branch)
+    integration_ref = f"refs/remotes/{config.target_remote}/{integration_branch}"
+    run(
+        [
+            "git",
+            "fetch",
+            "--no-tags",
+            config.target_remote,
+            f"+refs/heads/{integration_branch}:{integration_ref}",
+        ]
+    )
+    integration_sha = run(["git", "rev-parse", integration_ref]).stdout.strip()
+
+    base_ref = f"refs/remotes/{config.target_remote}/{config.base_branch}"
+    run(
+        [
+            "git",
+            "fetch",
+            "--no-tags",
+            config.target_remote,
+            f"+refs/heads/{config.base_branch}:{base_ref}",
+        ]
+    )
+    candidates: list[tuple[str, str]] = [
+        (config.base_branch, run(["git", "rev-parse", base_ref]).stdout.strip())
+    ]
+    pulls = order_pull_requests(list_pull_requests(config, state="open"))
+    for pull in pulls:
+        number = int(pull["number"])
+        head_ref = str((pull.get("head") or {}).get("ref", ""))
+        if head_ref in {integration_branch, config.sync_branch}:
+            continue
+        pull_ref = pull_head_ref(config, number)
+        candidates.append(
+            (
+                f"PR #{number} ({head_ref})",
+                run(["git", "rev-parse", pull_ref]).stdout.strip(),
+            )
+        )
+
+    missing = [
+        (label, sha)
+        for label, sha in candidates
+        if not is_ancestor(sha, integration_sha)
+    ]
+    if not missing:
+        return f"{integration_branch} already contains dev and every open PR head"
+    if config.dry_run:
+        return (
+            f"Would fast-forward {integration_branch} after merging "
+            f"{len(missing)} missing head(s)"
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix=f"upstream-sync-{integration_branch}-"
+    ) as temporary_directory:
+        worktree = Path(temporary_directory) / "worktree"
+        worktree_added = False
+        merged_labels: list[str] = []
+        try:
+            run(
+                [
+                    "git",
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(worktree),
+                    integration_sha,
+                ]
+            )
+            worktree_added = True
+            for label, candidate_sha in candidates:
+                current_sha = run(
+                    ["git", "-C", str(worktree), "rev-parse", "HEAD"]
+                ).stdout.strip()
+                if is_ancestor(candidate_sha, current_sha):
+                    continue
+                merge = run(
+                    [
+                        "git",
+                        "-C",
+                        str(worktree),
+                        "merge",
+                        "--no-edit",
+                        candidate_sha,
+                    ],
+                    check=False,
+                )
+                if merge.returncode:
+                    detail = (merge.stderr or merge.stdout).strip()
+                    raise AutomationError(
+                        f"{integration_branch} conflicts while merging {label}"
+                        + (f": {detail}" if detail else "")
+                    )
+                merged_labels.append(label)
+
+            final_sha = run(
+                ["git", "-C", str(worktree), "rev-parse", "HEAD"]
+            ).stdout.strip()
+            for label, candidate_sha in candidates:
+                if not is_ancestor(candidate_sha, final_sha):
+                    raise AutomationError(
+                        f"{integration_branch} is missing {label} after integration"
+                    )
+            run(
+                [
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "push",
+                    config.target_remote,
+                    f"HEAD:refs/heads/{integration_branch}",
+                ]
+            )
+        finally:
+            if worktree_added:
+                run(
+                    ["git", "worktree", "remove", "--force", str(worktree)],
+                    check=False,
+                )
+
+    return (
+        f"Fast-forwarded {integration_branch} from {integration_sha} to "
+        f"{final_sha} after merging {len(merged_labels)} head(s)"
+    )
 
 
 def write_summary(lines: list[str]) -> None:
+    """Print a run summary and append it to GitHub's step summary when set."""
     content = "\n".join(lines).rstrip() + "\n"
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
@@ -705,6 +919,7 @@ def write_summary(lines: list[str]) -> None:
 
 
 def execute(config: Config) -> int:
+    """Execute one complete upstream, PR-head, and integration-branch run."""
     base_sha, upstream_sha = fetch_branches(config)
     divergence = divergence_for(base_sha, upstream_sha)
     summary = [
@@ -746,7 +961,7 @@ def execute(config: Config) -> int:
         write_summary(summary)
         return 0
 
-    current, updated, failures = reconcile_open_pull_requests(config)
+    current, updated, skipped, failures = reconcile_open_pull_requests(config)
     summary.extend(
         [
             f"- PR branches already current: {len(current)}",
@@ -755,6 +970,9 @@ def execute(config: Config) -> int:
     )
     if updated:
         summary.extend(f"  - {entry}" for entry in updated)
+    if skipped:
+        summary.append(f"- PR branches skipped by fork policy: {len(skipped)}")
+        summary.extend(f"  - {entry}" for entry in skipped)
     if failures:
         summary.append(f"- PR branches requiring attention: {len(failures)}")
         summary.extend(f"  - {failure}" for failure in failures)
@@ -763,11 +981,15 @@ def execute(config: Config) -> int:
             print(f"::warning title=Upstream sync could not update a PR::{failure}")
         return 1
 
+    integration_result = refresh_integration_branch(config)
+    summary.append(f"- Integration: {integration_result}")
+
     write_summary(summary)
     return 0
 
 
 def main() -> int:
+    """Parse command-line options and report safe automation failures."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dry-run",
