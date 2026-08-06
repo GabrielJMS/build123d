@@ -13,14 +13,12 @@ The workflow synchronizes `gumyr/build123d:dev` into
    `automation/sync-upstream-dev` branch at the exact upstream head and creates
    or updates one marked pull request into `dev`. It never force-updates
    polluted `dev`.
-3. Once the upstream head is in downstream `dev`, the workflow asks GitHub to
-   merge the refreshed base into each stale open PR branch. GitHub performs
-   only clean branch updates. Maintainer-editable fork PRs bypass that API and
-   use an ordinary Git merge plus non-force push directly; same-repository PRs
-   use the same fallback if the API fails. True content conflicts and
-   inaccessible fork branches are reported in the workflow summary and fail
-   the job so a person can resolve them without the automation discarding
-   either side.
+3. Once the upstream head is in downstream `dev`, the workflow processes every
+   open PR in base-to-head dependency order. It updates stale heads with an
+   ordinary Git merge and non-force push, so stacked PRs are refreshed from
+   parent to child in the same run. True content conflicts and inaccessible
+   fork branches are reported in the workflow summary and fail the job so a
+   person can resolve them without the automation discarding either side.
 
 The stable automation branch is force-updated only with an exact
 `--force-with-lease`. An existing branch that is not recognizable as belonging

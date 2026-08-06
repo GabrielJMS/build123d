@@ -126,15 +126,12 @@ class PullRequestUpdateTests(unittest.TestCase):
             },
         }
 
-    def test_editable_fork_uses_direct_merge_without_api(self) -> None:
-        with (
-            patch.object(sync_upstream, "api") as api,
-            patch.object(
-                sync_upstream,
-                "merge_base_into_pull_head",
-                return_value="c" * 40,
-            ) as merge,
-        ):
+    def test_editable_fork_uses_direct_merge(self) -> None:
+        with patch.object(
+            sync_upstream,
+            "merge_base_into_pull_head",
+            return_value="c" * 40,
+        ) as merge:
             method = sync_upstream.update_pull_request_branch(
                 self.config,
                 pull=self.pull,
@@ -143,15 +140,11 @@ class PullRequestUpdateTests(unittest.TestCase):
             )
 
         self.assertEqual(method, "direct Git merge for editable fork")
-        api.assert_not_called()
         merge.assert_called_once()
 
-    def test_locked_fork_uses_neither_api_nor_direct_push(self) -> None:
+    def test_locked_fork_does_not_push(self) -> None:
         self.pull["maintainer_can_modify"] = False
-        with (
-            patch.object(sync_upstream, "api") as api,
-            patch.object(sync_upstream, "merge_base_into_pull_head") as merge,
-        ):
+        with patch.object(sync_upstream, "merge_base_into_pull_head") as merge:
             with self.assertRaises(sync_upstream.AutomationError):
                 sync_upstream.update_pull_request_branch(
                     self.config,
@@ -160,23 +153,15 @@ class PullRequestUpdateTests(unittest.TestCase):
                     base_sha="b" * 40,
                 )
 
-        api.assert_not_called()
         merge.assert_not_called()
 
-    def test_same_repository_api_failure_uses_direct_merge_fallback(self) -> None:
+    def test_same_repository_uses_direct_merge(self) -> None:
         self.pull["head"]["repo"]["full_name"] = self.config.repository
-        with (
-            patch.object(
-                sync_upstream,
-                "api",
-                side_effect=sync_upstream.ApiError("API unavailable"),
-            ),
-            patch.object(
-                sync_upstream,
-                "merge_base_into_pull_head",
-                return_value="c" * 40,
-            ) as merge,
-        ):
+        with patch.object(
+            sync_upstream,
+            "merge_base_into_pull_head",
+            return_value="c" * 40,
+        ) as merge:
             method = sync_upstream.update_pull_request_branch(
                 self.config,
                 pull=self.pull,
@@ -184,8 +169,36 @@ class PullRequestUpdateTests(unittest.TestCase):
                 base_sha="b" * 40,
             )
 
-        self.assertEqual(method, "direct Git merge fallback")
+        self.assertEqual(method, "direct Git merge")
         merge.assert_called_once()
+
+    def test_stacked_pull_requests_are_ordered_parent_first(self) -> None:
+        parent = {
+            "number": 4,
+            "base": {
+                "ref": "dev",
+                "repo": {"full_name": self.config.repository},
+            },
+            "head": {
+                "ref": "feature",
+                "repo": {"full_name": self.config.repository},
+            },
+        }
+        child = {
+            "number": 5,
+            "base": {
+                "ref": "feature",
+                "repo": {"full_name": self.config.repository},
+            },
+            "head": {
+                "ref": "feature-child",
+                "repo": {"full_name": self.config.repository},
+            },
+        }
+
+        ordered = sync_upstream.order_pull_requests([child, parent])
+
+        self.assertEqual([pull["number"] for pull in ordered], [4, 5])
 
 
 if __name__ == "__main__":

@@ -570,6 +570,54 @@ def merge_base_into_pull_head(
                 )
 
 
+def order_pull_requests(pulls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Order open PRs so a parent head is refreshed before its child PR."""
+    pending = list(pulls)
+    ordered: list[dict[str, Any]] = []
+    while pending:
+        pending_same_repo_heads = {
+            str((pull.get("head") or {}).get("ref", ""))
+            for pull in pending
+            if str(
+                ((pull.get("head") or {}).get("repo") or {}).get("full_name", "")
+            ).lower()
+            == str(
+                ((pull.get("base") or {}).get("repo") or {}).get("full_name", "")
+            ).lower()
+        }
+        ready = [
+            pull
+            for pull in pending
+            if str((pull.get("base") or {}).get("ref", ""))
+            not in pending_same_repo_heads
+        ]
+        if not ready:
+            # A cycle should not be possible on GitHub, but keep any malformed
+            # graph deterministic and let ancestry/push safeguards reject it.
+            ready = [min(pending, key=lambda pull: int(pull["number"]))]
+        ready.sort(key=lambda pull: int(pull["number"]))
+        ordered.extend(ready)
+        ready_numbers = {int(pull["number"]) for pull in ready}
+        pending = [pull for pull in pending if int(pull["number"]) not in ready_numbers]
+    return ordered
+
+
+def fetch_pull_base(config: Config, pull: dict[str, Any]) -> tuple[str, str]:
+    base_branch = str((pull.get("base") or {}).get("ref", ""))
+    validate_branch(base_branch)
+    base_ref = f"refs/remotes/{config.target_remote}/{base_branch}"
+    run(
+        [
+            "git",
+            "fetch",
+            "--no-tags",
+            config.target_remote,
+            f"+refs/heads/{base_branch}:{base_ref}",
+        ]
+    )
+    return base_branch, run(["git", "rev-parse", base_ref]).stdout.strip()
+
+
 def update_pull_request_branch(
     config: Config,
     *,
@@ -577,57 +625,32 @@ def update_pull_request_branch(
     actual_head_sha: str,
     base_sha: str,
 ) -> str:
-    """Update a PR head through GitHub, with a safe Git merge fallback."""
+    """Update a PR head with an ordinary merge and concurrency-safe push."""
     number = int(pull["number"])
     head = pull.get("head") or {}
     head_branch = str(head.get("ref", ""))
     head_repository = str((head.get("repo") or {}).get("full_name", ""))
     same_repository = head_repository.lower() == config.repository.lower()
 
-    # GitHub's update-branch endpoint can have surprising lifecycle side
-    # effects on cross-repository PRs. Use the explicit, non-force Git path for
-    # editable fork heads and never call the endpoint for them.
-    if not same_repository:
-        if not pull.get("maintainer_can_modify", False):
-            raise AutomationError("the fork branch does not allow maintainer updates")
-        merge_base_into_pull_head(
-            config,
-            pull_number=number,
-            head_repository=head_repository,
-            head_branch=head_branch,
-            head_sha=actual_head_sha,
-            base_sha=base_sha,
-        )
-        return "direct Git merge for editable fork"
-
-    try:
-        api(
-            "PUT",
-            f"repos/{config.repository}/pulls/{number}/update-branch",
-            {"expected_head_sha": actual_head_sha},
-        )
-        return "GitHub update-branch API"
-    except ApiError as api_error:
-        try:
-            merge_base_into_pull_head(
-                config,
-                pull_number=number,
-                head_repository=head_repository,
-                head_branch=head_branch,
-                head_sha=actual_head_sha,
-                base_sha=base_sha,
-            )
-        except AutomationError as merge_error:
-            raise AutomationError(
-                f"{api_error}; direct merge fallback also failed: {merge_error}"
-            ) from merge_error
-        return "direct Git merge fallback"
+    if not same_repository and not pull.get("maintainer_can_modify", False):
+        raise AutomationError("the fork branch does not allow maintainer updates")
+    merge_base_into_pull_head(
+        config,
+        pull_number=number,
+        head_repository=head_repository,
+        head_branch=head_branch,
+        head_sha=actual_head_sha,
+        base_sha=base_sha,
+    )
+    return (
+        "direct Git merge" if same_repository else "direct Git merge for editable fork"
+    )
 
 
 def reconcile_open_pull_requests(
-    config: Config, *, base_sha: str
+    config: Config,
 ) -> tuple[list[str], list[str], list[str]]:
-    pulls = list_pull_requests(config, state="open", base=config.base_branch)
+    pulls = order_pull_requests(list_pull_requests(config, state="open"))
     current: list[str] = []
     updated: list[str] = []
     failures: list[str] = []
@@ -640,18 +663,20 @@ def reconcile_open_pull_requests(
             continue
 
         try:
+            base_branch, base_sha = fetch_pull_base(config, pull)
             local_ref = pull_head_ref(config, number)
             actual_head_sha = run(["git", "rev-parse", local_ref]).stdout.strip()
         except AutomationError as exc:
-            failures.append(f"PR #{number}: could not fetch its head ({exc})")
+            failures.append(f"PR #{number}: could not fetch its base or head ({exc})")
             continue
 
+        label = f"PR #{number} ({head_ref} <- {base_branch})"
         if is_ancestor(base_sha, actual_head_sha):
-            current.append(f"PR #{number} ({head_ref})")
+            current.append(label)
             continue
 
         if config.dry_run:
-            updated.append(f"PR #{number} ({head_ref}) [dry run]")
+            updated.append(f"{label} [dry run]")
             continue
 
         try:
@@ -661,11 +686,10 @@ def reconcile_open_pull_requests(
                 actual_head_sha=actual_head_sha,
                 base_sha=base_sha,
             )
-            updated.append(f"PR #{number} ({head_ref}) via {update_method}")
+            updated.append(f"{label} via {update_method}")
         except AutomationError as exc:
             failures.append(
-                f"PR #{number} ({head_ref}): GitHub could not merge "
-                f"{config.base_branch} into the branch ({exc})"
+                f"{label}: could not merge {base_branch} into the branch ({exc})"
             )
 
     return current, updated, failures
@@ -722,9 +746,7 @@ def execute(config: Config) -> int:
         write_summary(summary)
         return 0
 
-    current, updated, failures = reconcile_open_pull_requests(
-        config, base_sha=effective_base_sha
-    )
+    current, updated, failures = reconcile_open_pull_requests(config)
     summary.extend(
         [
             f"- PR branches already current: {len(current)}",
