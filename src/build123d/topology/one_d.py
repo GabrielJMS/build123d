@@ -663,7 +663,15 @@ class Mixin1D(Shape[TOPODS]):
     def center(self, center_of: CenterOf = CenterOf.GEOMETRY) -> Vector:
         """Center of object
 
-        Return the center based on center_of
+        Return the center based on center_of:
+
+        - CenterOf.GEOMETRY (default): the point at the parametric midpoint of
+          the curve, i.e. ``position_at(0.5)``. This point lies **on** the
+          edge/wire — for a closed circle it is a point on the circumference,
+          not the circle center (use ``Edge.arc_center`` for that).
+        - CenterOf.MASS: the center of mass of the curve, which may lie off
+          the curve (e.g. the center of a closed circular edge).
+        - CenterOf.BOUNDING_BOX: the center of the axis-aligned bounding box.
 
         Args:
             center_of (CenterOf, optional): centering option. Defaults to CenterOf.GEOMETRY.
@@ -1578,7 +1586,11 @@ class Edge(Mixin1D[TopoDS_Edge]):
 
     @property
     def arc_center(self) -> Vector:
-        """center of an underlying circle or ellipse geometry."""
+        """Center of the underlying circle or ellipse geometry — exact, works
+        for open arcs as well as closed edges. Raises ValueError for other
+        geometry types. This is the value to use when the "center of a
+        circular edge" is needed (``center(CenterOf.GEOMETRY)`` returns the
+        parametric midpoint, a point on the curve itself)."""
 
         geom_type = self.geom_type
         geom_adaptor = self.geom_adaptor()
